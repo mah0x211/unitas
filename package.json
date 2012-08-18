@@ -1,0 +1,16 @@
+{
+    "name": "unitas",
+    "description": "command line tool for compile javascript files",
+    "author": "Masatoshi Teruya <https://twitter.com/mah0x211>",
+    "version": "0.0.1",
+    "bin": {
+        "unitas": "./unitas"
+    },
+    "preferGlobal": true,
+    "engines": {
+        "node": ">= 0.8.6"
+    },
+    "dependencies": {
+        "cli-color": ">= 0.1.7"
+    }
+}

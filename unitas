@@ -1,0 +1,732 @@
+#!/usr/bin/env node
+/* 
+    (C) 2012 Masatoshi Teruya <http://twitter.com/mah0x211>
+*/
+"use strict";
+var pkg = {
+        // builtins
+        fs: require('fs'),
+        util: require('util'),
+        path: require('path'),
+        exec: require('child_process').exec,
+        // external
+        clc: require('cli-color')
+    },
+    // contants
+    UNITAS = {
+        pwd: process.cwd(),
+        cwd: process.cwd(),
+        argv: undefined,
+        gcc: undefined,
+        cfg: undefined,
+        output: undefined,// PATH_ROOT + '/build'
+    },
+    L_INFO = 0,
+    L_OK = 1,
+    L_FAIL = 2,
+    L_WARN = 3,
+    LOG_LABEL = [
+        '[' + pkg.clc.blue('INFO') + '] ',
+        '[ ' + pkg.clc.green('OK') + ' ] ',
+        '[' + pkg.clc.red.bold('FAIL') + '] ',
+        '[' + pkg.clc.yellow('WARN') + '] '
+    ],
+    // parse for command line options
+    OPTS = [
+        {
+            name: 'help', 
+            abbr: 'h', 
+            desc: 'print usage(this document)'
+        },
+        {
+            name: 'config', 
+            abbr: 'c', 
+            desc: 'path of configuration json file',
+            arg: '/path/to/config',
+            required: true,
+        },
+        { 
+            name: 'output', 
+            abbr: 'o', 
+            desc: 'path of output directory',
+            arg: '/path/to/output',
+            def: 'current working directory',
+        },
+        {
+            name: 'gcc', 
+            abbr: 'g', 
+            desc: 'path of google\'s closure compile command',
+            arg: '/path/to/closure_compiler'
+        }
+    ],
+    RE_ISARG = new RegExp( 
+        '\\s+(' + 
+        '-(\\w)(?:\\s+([^-][^\\s]*))?' + 
+        '|' + 
+        '--(\\w+)(?:=([^\\s]+))?' + 
+        ')?', 
+        'g'
+    ),
+    // parse for configuration
+    RE_CFG_IS_VALID_RESTRICTION = new RegExp( /^(?:freeze|seal|preventExtensions)$/ ),
+    // parse for javascript
+    PREPROCESS_HEAD = '/{2,}\\s{0,}MARK:\\s{0,}',
+    RE_DEBUG_BEGIN = new RegExp( 
+        PREPROCESS_HEAD +
+        '@debug:begin\\s{0,}$', 'm' 
+    ),
+    RE_DEBUG_END = new RegExp(
+        PREPROCESS_HEAD + 
+        '@debug:end\\s{0,}$', 'm'
+    ),
+    RE_SRC_BEGIN = new RegExp( 
+        PREPROCESS_HEAD +
+        '@src:begin\\s{0,}$', 'm' 
+    ),
+    RE_SRC_END = new RegExp(
+        PREPROCESS_HEAD + 
+        '@src:end\\s{0,}$', 'm'
+    ),
+    RE_INIT = new RegExp( 
+        PREPROCESS_HEAD +
+        '@init:\\[(.+?)\\]\\s{0,}$', 'm'
+    ),
+    RE_EXTERN = new RegExp( 
+        PREPROCESS_HEAD +
+        '(@extern:(.+?)?)$', 'mg'
+    ),
+    // usage document
+    USAGE = '\
+' + pkg.clc.green( 'Config JSON format:' ) + ' \n\
+    { \n\
+        // use for compiled script file name and identifier name. \n\
+        "name": "<script_name>", \n\n\
+        // location path of source files \n\
+        "srcs": [ \n\
+            "</path/to/target/script.js>", \n\
+            ... \n\
+        ], \n\n\
+        // parent object: default "window" \n\
+        "parent": "<valid-identifier-name>", \n\n\
+        // set object restriction if defined \n\
+        "restriction": "<freeze|seal|preventExtensions>", \n\n\
+        // gcc options: closure-compiler --help \n\
+        "gcc": { \n\
+            // default options \n\
+            "warning_level": "VERBOSE", \n\
+            "language_in": "ECMASCRIPT5_STRICT", \n\
+            "summary_detail_level": 3, \n\
+            "externs": "<output directory>/<name>_externs.js", \n\
+            // fixed options \n\
+            "js": "...", \n\
+            "js_output_file": "..." \n\
+        } \n\
+    } \n\n\
+' + pkg.clc.green( 'Preprocessor directives:' ) + ' \n\n\
+    ' + pkg.clc.magenta( '// MARK: @init:[<arg1>,<arg2>,...]' ) + ' \n\
+    ' + pkg.clc.yellow( '<arg>: argument of initializer.' ) + ' \n\n\
+    ' + pkg.clc.magenta( '// MARK: @src:begin' ) + ' \n\
+    source code... \n\
+    ... \n\
+    ' + pkg.clc.magenta( '// MARK: @src:end' ) + ' \n\
+    ' + pkg.clc.yellow( 'slice source code from tail of @src:begin directive \n\
+    to head of @src:end directive.' ) + ' \n\n\
+    ' + pkg.clc.magenta( '// MARK: @debug:begin' ) + ' \n\
+    source code... \n\
+    ... \n\
+    ' + pkg.clc.magenta( '// MARK: @debug:end' ) + ' \n\
+    ' + pkg.clc.yellow( 'remove source code from head of @debug:begin directive \n\
+    to tail of @debug:end directive.' ) + ' \n\n\
+    ' + pkg.clc.magenta( '// MARK: @extern:<extern-property>:<literal-notation>' ) + ' \n\
+    ' + pkg.clc.yellow( '<extern-property>: name of property \n\
+    <literal-notation>: define type of property by literal notation.' ) + ' \n\n\
+';
+
+
+function throwError( e, task )
+{
+    if( typeof task === 'string' ){
+        e.message = 'failed to ' + task + '\nreason: ' + e.message;
+    }
+    throw e;
+}
+
+function log( msg, type, indent )
+{
+    var sp = '',
+        label;
+    
+    if( isFinite( indent ) )
+    {
+        indent = +indent;
+        for( var i = 0; i < indent; i++ ){
+            sp += ' ';
+        }
+    }
+    if( !isFinite( type ) || !( label = LOG_LABEL[+type] ) ){
+        label = '';//LOG_LABEL[L_INFO];
+    }
+    
+    console.log( sp + label + msg );
+}
+
+function printUsage()
+{
+    var idt4 = '    ',
+        idt8 = idt4 + idt4,
+        idt12 = idt4 + idt8,
+        head = '\n' + pkg.clc.green( 'Usage:' ) + '\n\n    unitas',
+        tail = '',
+        len = OPTS.length,
+        opt,i,arg;
+    
+    for( i = 0; i < len; i++ )
+    {
+        opt = OPTS[i];
+        arg = '-' + opt.abbr;
+        tail += '\n' + idt4 + '-' + opt.abbr + ', --' + opt.name + 
+                ' : ' + pkg.clc.yellow( opt.desc );
+        
+        if( opt.arg ){
+            arg += ' ' + opt.arg;
+        }
+        
+        if( opt.required ){
+            tail += pkg.clc.green.bold(' (required)');
+            head += ' ' + arg;
+        }
+        else {
+            head += ' [' + arg + ']';
+        }
+        if( opt.def ){
+            tail += '\n' + idt4 + '[default] ' + opt.def;
+        }
+        tail += '\n';
+    }
+    
+    console.log( head + '\n' + tail + '\n\n' + USAGE );
+    process.exit(0);
+}
+
+// MARK: initilize
+function init()
+{
+    log( 'initilize...', L_INFO );
+    // check command line arguments
+    parseArgv();
+    // check output path
+    if( UNITAS.argv.output )
+    {
+        var stat;
+        
+        log( 'check --output path: ' + UNITAS.argv.output );
+        UNITAS.output = pkg.path.resolve( UNITAS.argv.output );
+        try
+        {
+            stat = pkg.fs.statSync( UNITAS.output );
+            if( !stat.isDirectory() ){
+                log( 'passed argument --output value is not path of directory', L_FAIL );
+                printUsage();
+            }
+        }
+        catch(e){
+            throwError( e );
+        }
+    }
+    else {
+        UNITAS.output = UNITAS.cwd;
+    }
+    
+    // check config path
+    log( 'check --config path: ' + UNITAS.argv.config );
+    // find configure json path
+    try {
+        UNITAS.argv.config = pkg.path.resolve( UNITAS.argv.config );
+        UNITAS.argv.config = pkg.fs.realpathSync( UNITAS.argv.config );
+    }
+    catch(e){
+        throwError( e );
+    }
+    
+    // check has goole closure compiler
+    if( UNITAS.argv.gcc )
+    {
+        try {
+            UNITAS.gcc = pkg.fs.realpathSync( pkg.path.resolve( UNITAS.argv.gcc ) );
+        }catch(e){
+            log( e.message, L_FAIL );
+            printUsage();
+        }
+    }
+    Object.freeze( UNITAS.argv );
+    
+    // load configure json
+    loadConfig();
+    
+    // chdir
+    log( 'chdir: ' + UNITAS.output );
+    process.chdir( UNITAS.output );
+    
+    UNITAS.cwd = process.cwd();
+    Object.freeze( UNITAS );
+}
+
+function parseArgv()
+{
+    var args = { __proto__: null },
+        argv = process.argv.join(' '),
+        remain = argv,
+        name,val,abbr;
+    
+    // parse command line arguments
+    while( RE_ISARG.test( argv ) )
+    {
+        if( ( name = RegExp.$2 ) ){
+            args[name] = RegExp.$3;
+        }
+        else if( ( name = RegExp.$4 ) ){
+            args[name] = RegExp.$5;
+        }
+        
+        if( name )
+        {
+            if( name === 'h' || name === 'help' ){
+                printUsage();
+            }
+            remain = remain.replace( RegExp.$1, '' );
+        }
+    }
+    
+    // check name and requirement
+    OPTS.forEach(function(opt)
+    {
+        name = opt.name;
+        abbr = opt.abbr;
+        if( args[abbr] )
+        {
+            // same option declare
+            if( args[name] ){
+                throw new Error( 'invalid arguments' );
+            }
+            args[name] = args[abbr];
+            delete args[abbr];
+        }
+        // undefined required options
+        if( name in args && opt.arg && !args[name] ){
+            log( 'passed argument --' + name + ' value is undefined', L_FAIL );
+            printUsage();
+        }
+        else if( opt.required && !args[name] ){
+            log( 'require option: --' + name, L_FAIL );
+            printUsage();
+        }
+    });
+    // append plain arguments
+    args._ = remain.replace( /(^\s+|\s+|\s+$)/g, ' ' ).split(' ').slice(2);
+    
+    UNITAS.argv = args;
+}
+
+function loadConfig()
+{
+    var path = UNITAS.argv.config,
+        file,cfg,tmp;
+    
+    log( 'check configuration...' );
+    // find configure json path
+    try {
+        file = pkg.fs.readFileSync( path, 'utf8' );
+    }
+    catch(e){
+        throwError( e, 'readFile: ' + path );
+    }
+    // parse json
+    try {
+        cfg = JSON.parse( file );
+    }catch(e){
+        throwError( e, 'JSON.parse:' + path );
+    }
+    
+    // change to directory path
+    path = path.split('/');
+    path.pop();
+    path = path.join('/');
+    
+    // check name
+    log( 'check format: config.name' );
+    if( typeof cfg.name !== 'string' ){
+        log( 'invalid format: type of config.name must be string', L_FAIL );
+        printUsage();
+    }
+    if( cfg.name.match( /\s/ ) ){
+        log( 'invalid value: space can not be included in config.name', L_FAIL );
+        printUsage();
+    }
+    
+    // check srcs
+    log( 'check format: config.srcs' );
+    if( !( cfg.srcs instanceof Array ) ){
+        log( 'invalid format: type of config.srcs must be array', L_FAIL );
+        printUsage();
+    }
+    if( !cfg.srcs.length ){
+        log( 'invalid value: config.srcs must be not empty', L_FAIL );
+        printUsage();
+    }
+    // check source file path
+    for( var i = 0, len = cfg.srcs.length; i < len; i++ )
+    {
+        file = cfg.srcs[i];
+        log( 'path resolve: ' + file );
+        // relative path
+        if( file.charAt(0) !== '/' ){
+            file = path + '/' + file;
+        }
+        try {
+            file = pkg.fs.realpathSync( pkg.path.resolve( file ) );
+        }catch(e){
+            log( e.message, L_FAIL );
+            process.exit(1);
+        }
+        cfg.srcs[i] = file;
+    }
+    
+    // check parent
+    if( cfg.parent )
+    {
+        log( 'check format: config.parent' );
+        if( typeof cfg.parent !== 'string' ){
+            log( 'invalid format: type of config.parent must be string', L_FAIL );
+            printUsage();
+        }
+        cfg.parent =cfg.parent.trim();
+        if( cfg.parent.charAt(0) === '.' || 
+                 cfg.parent.charAt( cfg.parent.length - 1 ) === '.' ){
+            log( 'invalid value: config.parent must be valid identifier name', L_FAIL );
+            printUsage();
+        }
+        cfg.parent += '.';
+    }
+    else {
+        cfg.parent = 'window.';
+    }
+    
+    // check restriction
+    if( cfg.restriction )
+    {
+        log( 'check format: config.restriction' );
+        if( typeof cfg.restriction !== 'string' ){
+            log( 'invalid format: type of config.restriction must be string', L_FAIL );
+            printUsage();
+        }
+        else if( !RE_CFG_IS_VALID_RESTRICTION.test( cfg.restriction ) ){
+            log( 'invalid value: config.restriction must be <freeze|seal|preventExtensions>', L_FAIL );
+            printUsage();
+        }
+    }
+    
+    // check gcc
+    if( cfg.gcc )
+    {
+        var opts = { 
+                __proto__: null,
+                // default options
+                warning_level: 'VERBOSE',
+                language_in: 'ECMASCRIPT5_STRICT',
+                summary_detail_level: 3
+            };
+        
+        log( 'check format: config.gcc' );
+        if( typeof cfg.gcc !== 'object' ){
+            log( 'invalid value: config.srcs is empty', L_FAIL );
+            printUsage();
+        }
+        // check options
+        Object.keys( cfg.gcc ).forEach(function(key)
+        {
+            tmp = cfg.gcc[key];
+            if( typeof tmp !== 'string' && !isFinite( tmp ) ){
+                log( 'invalid value: value of config.gcc.<key> must be string or number', L_FAIL );
+                printUsage();
+            }
+            opts[key] = tmp.trim();
+        });
+        // check externs
+        if( typeof opts.externs === 'string' )
+        {
+            var stat;
+            
+            opts.externs = pkg.path.resolve( opts.externs );
+            try {
+                opts.externs = pkg.fs.realpathSync( opts.externs );
+            }catch(e){
+                log( e.message, L_FAIL );
+                process.exit(1);
+            }
+            try
+            {
+                stat = pkg.fs.statSync( UNITAS.output );
+                if( !stat.isFile() ){
+                    log( 'invalid value: value of config.gcc.externs value is not path of file', L_FAIL );
+                    printUsage();
+                }
+            }
+            catch(e){
+                throwError( e );
+            }
+        }
+        // overwrite options
+        opts.js = './' + cfg.name + '.js';
+        opts.js_output_file = './' + cfg.name + '_cc.js';
+        cfg.gcc = opts;
+        Object.freeze( cfg.gcc );
+    }
+    
+    Object.freeze( cfg );
+    UNITAS.cfg = cfg;
+}
+
+// MARK: build
+function removeDebugCode( src )
+{
+    var begin,end;
+    
+    // directive: @debug:begin and @debug:end
+    log( 'find ' + pkg.clc.green( '@debug' ) + ' directive...' );
+    while( ( begin = RE_DEBUG_BEGIN.exec( src ) ) )
+    {
+        log( pkg.clc.yellow( '@debug:begin' ) + ' at ' + begin.index );
+        if( !( end = RE_DEBUG_END.exec( src ) ) ){
+            log( '@debug:end directive not found', L_FAIL );
+            process.exit(1);
+        }
+        log( pkg.clc.yellow( '@debug:end' ) + ' at ' + end.index );
+        begin = begin.index;
+        end = end.index + end[0].length;
+        // slice source
+        log( 'extract source code index from:' + begin + ' to:' + end );
+        src = src.substring( 0, begin ) + src.substring( end );
+    }
+    
+    return src;
+}
+
+function make()
+{
+    var file = './' + UNITAS.cfg.name + '.js',
+        objName = UNITAS.cfg.parent + UNITAS.cfg.name,
+        out = objName + ' = { __proto__: null };\n',
+        externs = {
+            __proto__: null
+        },
+        match,src,begin,end,init,ext;
+    
+    log( 'make start', L_INFO );
+    UNITAS.cfg.srcs.forEach(function(path)
+    {
+        var lib = {
+                init: [],
+                // extract filename without extension
+                name: path.split('/').pop().split('.').shift(),
+                begin: 0,
+                end: 0
+            };
+        
+        // init extern hash
+        externs[lib.name] = {
+            __proto__: null
+        };
+        
+        // read source file
+        log( 'file: ' + pkg.clc.green( path ) );
+        src = pkg.fs.readFileSync( path, 'utf8' );
+
+        // find initialize arguments
+        log( 'find ' + pkg.clc.green( '@init' ) + ' directive...' );
+        // directive: @init[arg,arg,...]
+        if( ( init = RE_INIT.exec( src ) ) ){
+            init[1].split(',').forEach(function(arg){
+                lib.init.push( objName + '.' + arg );
+            });
+            log( pkg.clc.yellow( '@init:[' + lib.init + ']' ) );
+        }
+        
+        // find slice position
+        // directive: @src:begin and @src:end
+        log( 'find ' + pkg.clc.green( '@src' ) + ' directive...' );
+        if( ( begin = RE_SRC_BEGIN.exec( src ) ) )
+        {
+            log( pkg.clc.yellow( '@src:begin' ) + ' at ' + begin.index );
+            if( !( end = RE_SRC_END.exec( src ) ) ){
+                log( '@src:end directive not found', L_FAIL );
+                process.exit(1);
+            }
+            log( pkg.clc.yellow( '@src:end' ) + ' at ' + end.index );
+            lib.begin = begin.index + begin[0].length;
+            lib.end = end.index;
+        }
+        else {
+            lib.begin = 0;
+            lib.end = src.length;
+        }
+        // slice source
+        log( 'extract source code index from:' + lib.begin + ' to:' + lib.end );
+        src = src.substring( lib.begin, lib.end );
+        
+        // remove debug codes
+        src = removeDebugCode( src );
+        
+        // find externs
+        log( 'find ' + pkg.clc.green( '@extern' ) + ' directive...' );
+        while( ( match = RE_EXTERN.exec( src ) ) )
+        {
+            ext = match[1].split(':');
+            // check length
+            if( ext.length !== 3 || 
+                !( ext[1] = ext[1].trim() ) ||
+                !( ext[2] = ext[2].trim() ) )
+            {
+                log( 
+                    'invalid directive format: ' + pkg.clc.green( match[1] ) + 
+                    ' at \n--------------------------------------------------------------------------------\n' + 
+                    pkg.clc.magenta( src.substring( match.index, 50 ) + '...' ) + 
+                    '\n--------------------------------------------------------------------------------', 
+                    L_FAIL
+                );
+                printUsage();
+            }
+            log( pkg.clc.yellow( match[1] ) );
+            externs[lib.name][ext[1]] = ext[2];
+        }
+        
+        // append output
+        out += '// ' + path.replace( path + '/', '' ) + 
+                ':' + lib.begin + 
+                ':' + lib.end + 
+                ':[' + lib.init.join(',') + ']\n';
+        out +=  objName + '.' + lib.name + ' = (' + src + ')(' + 
+                lib.init.join(',') + ');\n';
+    });
+    
+    // finalize
+    if( UNITAS.cfg.restriction ){
+        out += '\nObject.' + UNITAS.cfg.restriction + '(' + objName + ');\n';
+    }
+    // output to file
+    log( 'output to file: ' + pkg.clc.green( file ), L_INFO );
+    pkg.fs.writeFileSync( file, out );
+    
+    return {
+        file: file,
+        externs: externs
+    };
+}
+
+function compileWithGCC( made, callback )
+{
+    var compiled = function( e, so, se )
+        {
+            if( e ){
+                throw e;
+            }
+            else
+            {
+                if( se ){
+                    log( se.trim(), L_INFO );
+                }
+                log( 
+                    'rename ' + pkg.clc.green( UNITAS.cfg.gcc.js_output_file ) + 
+                    ' to ' +  pkg.clc.green( made.file ), L_INFO
+                );
+                pkg.fs.renameSync( UNITAS.cfg.gcc.js_output_file, made.file );
+                callback();
+            }
+        },
+        gcc = UNITAS.gcc,
+        extFile = './' + UNITAS.cfg.name + '_externs.js';
+    
+    // build externs
+    if( !UNITAS.cfg.gcc.externs )
+    {
+        var objName = UNITAS.cfg.parent + UNITAS.cfg.name,
+            extout = 'var ',
+            externs = made.externs,
+            libname,ext,prop,line;
+        
+        log( 'build externs...', L_INFO );
+        // extern parent
+        ext = [];
+        UNITAS.cfg.parent.split('.').forEach(function(key)
+        {
+            if( key ){
+                ext.push( key );
+                line = ext.join('.') + ' = {};';
+                log( pkg.clc.magenta( line ) );
+                extout += line + '\n';
+            }
+        });
+        line = objName + ' = {};';
+        log( pkg.clc.magenta( line ) );
+        extout += line + '\n';
+        // extern properties
+        for( libname in externs )
+        {
+            if( ( ext = externs[libname] ) )
+            {
+                line = objName + '.' + libname  + ' = ' + ext[libname] + ';';
+                log( pkg.clc.magenta( line ) );
+                extout += '\n' + line + ';\n';
+                delete ext[libname];
+                for( prop in ext ){
+                    line = objName + '.' + libname + '.' + prop + ' = ' + ext[prop] + ';';
+                    log( pkg.clc.magenta( line ) );
+                    extout += line + '\n';
+                }
+            }
+        }
+        log( 'output to file: ' + pkg.clc.green( extFile ), L_INFO );
+        pkg.fs.writeFileSync( extFile, extout );
+    }
+    // use user defined externs.js
+    else {
+        extFile = UNITAS.cfg.gcc.externs;
+    }
+    
+    gcc += ' --externs=' + extFile;
+    // set gcc command args
+    Object.keys( UNITAS.cfg.gcc ).forEach(function(key)
+    {
+        if( key !== 'externs' ){
+            gcc += ' --' + key + '=' + UNITAS.cfg.gcc[key];
+        }
+    });
+    log( 'exec gcc: ' + pkg.clc.green( gcc ), L_INFO );
+    pkg.exec( gcc, compiled );
+}
+
+
+function main()
+{
+    var made = undefined;
+    
+    init();
+    log( 'compile configuration:\n' + pkg.util.inspect( UNITAS, false, 10, true ), L_OK );
+ 
+    made = make();
+    log( 'script files has been merged into ' + pkg.clc.green( made.file ), L_OK );
+    // use closure-compiler
+    if( UNITAS.gcc )
+    {
+        compileWithGCC( made, function(){
+            log( 'done', L_OK );
+            process.exit(0);
+        });
+    }
+    else {
+        process.exit(0);
+    }
+}
+
+main();
+
+
